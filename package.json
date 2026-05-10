@@ -1,0 +1,16 @@
+{
+  "name": "autikr-server",
+  "version": "1.0.0",
+  "description": "Autikr WhatsApp Server",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "6.7.16",
+    "express": "^4.21.0",
+    "cors": "^2.8.5",
+    "pino": "^9.0.0",
+    "groq-sdk": "^0.8.0"
+  }
+}

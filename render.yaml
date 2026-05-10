@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: autikr-server
+    runtime: node
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: NODE_VERSION
+        value: 20
