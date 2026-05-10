@@ -62,44 +62,46 @@ function broadcast(type, data = {}) {
 
 // ─── WhatsApp Connection ────────────────────────────────────────
 async function connectWhatsApp(phoneNumber) {
-  // PREVENT MULTIPLE CONNECTIONS
   if (isConnecting) {
     console.log('[WA] Already connecting, skipping...');
     return;
   }
   
-  // Close existing socket
-  if (sock) {
-    try { sock.end(); } catch(e) {}
-    sock = null;
-  }
+  if (sock) { try { sock.end(); } catch(e) {} sock = null; }
   
   isConnecting = true;
-  console.log('[WA] Starting connection for:', phoneNumber);
+  const cleanNum = phoneNumber.replace(/[^0-9]/g, '');
+  console.log('[WA] Starting connection for:', cleanNum);
+
+  // Always clear old session for fresh pairing
+  const fs = require('fs');
+  try { fs.rmSync('./auth_session', { recursive: true, force: true }); } catch(e) {}
 
   const { state, saveCreds } = await useMultiFileAuthState('./auth_session');
 
   sock = makeWASocket({
     auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
     logger, printQRInTerminal: false,
-    browser: ['Autikr', 'Chrome', '120.0.0']
+    browser: ['Autikr', 'Chrome', '120.0.0'],
+    connectTimeoutMs: 60000
   });
 
-  // Request pairing code ONLY if not already registered
+  // Request pairing code after WebSocket is ready
   if (!state.creds.registered) {
-    const cleanNum = phoneNumber.replace(/[^0-9]/g, '');
     setTimeout(async () => {
+      if (!sock) return;
       try {
+        console.log('[WA] Requesting pairing code for:', cleanNum);
         const code = await sock.requestPairingCode(cleanNum);
         lastPairingCode = code;
-        console.log('[WA] Pairing code:', code);
+        console.log('[WA] ✅ Pairing code:', code);
         broadcast('pairing_code', { code });
       } catch (e) {
         console.error('[WA] Pairing code error:', e.message);
-        broadcast('error', { message: 'Failed to get pairing code: ' + e.message });
+        broadcast('error', { message: 'Pairing failed: ' + e.message });
         isConnecting = false;
       }
-    }, 4000);
+    }, 8000); // Wait 8 seconds for WS to stabilize
   } else {
     console.log('[WA] Already registered, connecting...');
   }
@@ -108,24 +110,27 @@ async function connectWhatsApp(phoneNumber) {
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect } = update;
+    console.log('[WA] Connection update:', connection);
+    
     if (connection === 'close') {
       isConnected = false;
       isConnecting = false;
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      console.log('[WA] Closed, status:', statusCode);
       broadcast('wa_status', { status: 'disconnected' });
-      const code = lastDisconnect?.error?.output?.statusCode;
-      console.log('[WA] Connection closed, reason:', code);
       
-      // Only reconnect if NOT logged out and already registered
-      if (code !== DisconnectReason.loggedOut && state.creds.registered) {
+      if (statusCode === 405 || statusCode === DisconnectReason.loggedOut) {
+        // 405 = pairing rejected, clear and let user try again
+        console.log('[WA] Pairing rejected or logged out, clearing session');
+        try { fs.rmSync('./auth_session', { recursive: true, force: true }); } catch(e) {}
+        broadcast('error', { message: 'Pairing failed (405). Tap "Get Pairing Code" again.' });
+      } else if (statusCode === DisconnectReason.restartRequired) {
+        console.log('[WA] Restart required, reconnecting in 5s...');
+        setTimeout(() => connectWhatsApp(phoneNumber), 5000);
+      } else if (state.creds.registered && statusCode !== DisconnectReason.loggedOut) {
         console.log('[WA] Reconnecting in 10s...');
         setTimeout(() => connectWhatsApp(phoneNumber), 10000);
-      } else if (code === DisconnectReason.loggedOut) {
-        console.log('[WA] Logged out, clearing session');
-        // Clear session on logout
-        const fs = require('fs');
-        try { fs.rmSync('./auth_session', { recursive: true, force: true }); } catch(e) {}
       }
-      // Do NOT auto-reconnect if not registered (waiting for pairing)
     } else if (connection === 'open') {
       isConnected = true;
       isConnecting = false;
