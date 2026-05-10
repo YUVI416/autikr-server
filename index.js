@@ -3,6 +3,8 @@ const cors = require('cors');
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const Groq = require('groq-sdk');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(cors());
@@ -10,6 +12,11 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 7878;
 const logger = pino({ level: 'silent' });
+const AUTH_DIR = path.join(process.cwd(), 'auth_session');
+
+// Prevent crash on unhandled errors
+process.on('uncaughtException', (e) => { console.log('[CRASH PREVENTED]', e.message); });
+process.on('unhandledRejection', (e) => { console.log('[REJECTION PREVENTED]', e?.message || e); });
 
 // ─── State ──────────────────────────────────────────────────────
 let sock = null;
@@ -57,62 +64,66 @@ async function generateAIReply(message) {
 // ─── SSE Broadcast ──────────────────────────────────────────────
 function broadcast(type, data = {}) {
   const payload = JSON.stringify({ type, ...data, time: Date.now() });
-  sseClients.forEach(res => { try { res.write(`data: ${payload}\n\n`); } catch(e) {} });
+  sseClients = sseClients.filter(res => { try { res.write(`data: ${payload}\n\n`); return true; } catch(e) { return false; } });
+}
+
+// ─── Ensure auth dir exists ─────────────────────────────────────
+function ensureAuthDir() {
+  try { if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true }); } catch(e) {}
 }
 
 // ─── WhatsApp Connection ────────────────────────────────────────
 async function connectWhatsApp(phoneNumber) {
-  if (isConnecting) {
-    console.log('[WA] Already connecting, skipping...');
-    return;
-  }
-  
+  if (isConnecting) return;
   if (sock) { try { sock.end(); } catch(e) {} sock = null; }
   
   isConnecting = true;
   const cleanNum = phoneNumber.replace(/[^0-9]/g, '');
   console.log('[WA] Starting connection for:', cleanNum);
 
-  // Ensure auth_session directory exists
-  const fs = require('fs');
-  const path = require('path');
-  const authDir = path.join(process.cwd(), 'auth_session');
-  if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
-
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
+  ensureAuthDir();
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
   sock = makeWASocket({
     auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
     logger, printQRInTerminal: false,
     browser: ['Autikr', 'Chrome', '120.0.0'],
-    connectTimeoutMs: 60000
+    connectTimeoutMs: 120000,
+    markOnlineOnConnect: false
   });
 
-  // Request pairing code after WebSocket is ready
-  if (!state.creds.registered) {
-    setTimeout(async () => {
-      if (!sock) return;
-      try {
-        console.log('[WA] Requesting pairing code for:', cleanNum);
-        const code = await sock.requestPairingCode(cleanNum);
-        lastPairingCode = code;
-        console.log('[WA] ✅ Pairing code:', code);
-        broadcast('pairing_code', { code });
-      } catch (e) {
-        console.error('[WA] Pairing code error:', e.message);
-        broadcast('error', { message: 'Pairing failed: ' + e.message });
-        isConnecting = false;
-      }
-    }, 8000); // Wait 8 seconds for WS to stabilize
-  } else {
-    console.log('[WA] Already registered, connecting...');
-  }
+  // Save creds safely
+  sock.ev.on('creds.update', async () => {
+    try { ensureAuthDir(); await saveCreds(); } catch(e) { console.log('[WA] Creds save error:', e.message); }
+  });
 
-  sock.ev.on('creds.update', saveCreds);
-
-  sock.ev.on('connection.update', (update) => {
+  // Request pairing code - use connection update event instead of timer
+  let pairingRequested = false;
+  
+  sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect } = update;
-    console.log('[WA] Connection update:', connection);
+    console.log('[WA] Connection update:', connection || JSON.stringify(update));
+    
+    // Request pairing code as soon as we start connecting (if not registered)
+    if (!pairingRequested && !state.creds.registered && connection !== 'close') {
+      pairingRequested = true;
+      // Small delay to let the socket stabilize
+      setTimeout(async () => {
+        if (!sock) return;
+        try {
+          console.log('[WA] Requesting pairing code for:', cleanNum);
+          const code = await sock.requestPairingCode(cleanNum);
+          lastPairingCode = code;
+          console.log('[WA] ✅ Pairing code:', code);
+          broadcast('pairing_code', { code });
+        } catch (e) {
+          console.error('[WA] Pairing code error:', e.message);
+          broadcast('error', { message: 'Pairing error: ' + e.message });
+          pairingRequested = false;
+          isConnecting = false;
+        }
+      }, 2000); // 2 sec delay - faster than before
+    }
     
     if (connection === 'close') {
       isConnected = false;
@@ -121,21 +132,24 @@ async function connectWhatsApp(phoneNumber) {
       console.log('[WA] Closed, status:', statusCode);
       broadcast('wa_status', { status: 'disconnected' });
       
-      if (statusCode === 405 || statusCode === DisconnectReason.loggedOut) {
-        // 405 = pairing rejected, clear and let user try again
-        console.log('[WA] Pairing rejected or logged out, clearing session');
-        try { fs.rmSync('./auth_session', { recursive: true, force: true }); } catch(e) {}
-        broadcast('error', { message: 'Pairing failed (405). Tap "Get Pairing Code" again.' });
-      } else if (statusCode === DisconnectReason.restartRequired) {
-        console.log('[WA] Restart required, reconnecting in 5s...');
-        setTimeout(() => connectWhatsApp(phoneNumber), 5000);
-      } else if (state.creds.registered && statusCode !== DisconnectReason.loggedOut) {
+      if (statusCode === DisconnectReason.restartRequired) {
+        console.log('[WA] Restart required, reconnecting in 3s...');
+        setTimeout(() => connectWhatsApp(phoneNumber), 3000);
+      } else if (statusCode === 405 || statusCode === DisconnectReason.loggedOut) {
+        console.log('[WA] Session rejected, ready for retry');
+        try { 
+          const files = fs.readdirSync(AUTH_DIR);
+          files.forEach(f => { try { fs.unlinkSync(path.join(AUTH_DIR, f)); } catch(e) {} });
+        } catch(e) {}
+        broadcast('error', { message: 'Connection closed. Tap "Get Pairing Code" to retry.' });
+      } else if (state.creds.registered) {
         console.log('[WA] Reconnecting in 10s...');
-        setTimeout(() => connectWhatsApp(phoneNumber), 10000);
+        setTimeout(() => { isConnecting = false; connectWhatsApp(phoneNumber); }, 10000);
       }
     } else if (connection === 'open') {
       isConnected = true;
       isConnecting = false;
+      pairingRequested = false;
       console.log('[WA] ✅ Connected successfully!');
       broadcast('wa_status', { status: 'connected' });
     }
@@ -146,23 +160,18 @@ async function connectWhatsApp(phoneNumber) {
       if (msg.key.fromMe) continue;
       const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
       if (!text) continue;
-
       const isGroup = msg.key.remoteJid?.endsWith('@g.us');
       const from = msg.key.remoteJid;
-
       stats.received++;
       broadcast('message', { from, body: text, isGroup });
-
       if (!autoReply) continue;
       if (isGroup && !settings.replyToGroups) continue;
-
       try {
         const reply = await generateAIReply(text);
         await new Promise(r => setTimeout(r, (settings.replyDelay || 2) * 1000));
         await sock.sendMessage(from, { text: reply });
         stats.replied++;
         broadcast('reply', { to: from, body: reply });
-        console.log('[WA] Replied to', from.split('@')[0]);
       } catch (e) {
         stats.errors++;
         broadcast('error', { message: e.message });
@@ -184,18 +193,16 @@ app.post('/api/connect', async (req, res) => {
   isConnecting = false;
   lastPairingCode = '';
   
-  // Clear old session files (not folder) for fresh pairing
-  const fs = require('fs');
-  const path = require('path');
-  const authDir = path.join(process.cwd(), 'auth_session');
-  if (fs.existsSync(authDir)) {
-    const files = fs.readdirSync(authDir);
-    files.forEach(f => { try { fs.unlinkSync(path.join(authDir, f)); } catch(e) {} });
-  }
+  // Clear old session files for fresh pairing
+  ensureAuthDir();
+  try {
+    const files = fs.readdirSync(AUTH_DIR);
+    files.forEach(f => { try { fs.unlinkSync(path.join(AUTH_DIR, f)); } catch(e) {} });
+  } catch(e) {}
   
   try {
-    await connectWhatsApp(phone);
-    res.json({ success: true, message: 'Connecting... wait ~8 seconds for pairing code' });
+    connectWhatsApp(phone);
+    res.json({ success: true, message: 'Connecting... wait for pairing code' });
   } catch (e) {
     isConnecting = false;
     res.json({ success: false, message: e.message });
@@ -205,16 +212,22 @@ app.post('/api/connect', async (req, res) => {
 app.post('/api/reset', async (_, res) => {
   if (sock) { try { sock.end(); } catch(e) {} sock = null; }
   isConnected = false; isConnecting = false; lastPairingCode = '';
-  const fs = require('fs');
-  try { fs.rmSync('./auth_session', { recursive: true, force: true }); } catch(e) {}
+  ensureAuthDir();
+  try {
+    const files = fs.readdirSync(AUTH_DIR);
+    files.forEach(f => { try { fs.unlinkSync(path.join(AUTH_DIR, f)); } catch(e) {} });
+  } catch(e) {}
   res.json({ success: true, message: 'Session cleared' });
 });
 
 app.post('/api/disconnect', async (_, res) => {
   if (sock) { try { await sock.logout(); } catch(e) {} sock = null; }
   isConnected = false; isConnecting = false;
-  const fs = require('fs');
-  try { fs.rmSync('./auth_session', { recursive: true, force: true }); } catch(e) {}
+  ensureAuthDir();
+  try {
+    const files = fs.readdirSync(AUTH_DIR);
+    files.forEach(f => { try { fs.unlinkSync(path.join(AUTH_DIR, f)); } catch(e) {} });
+  } catch(e) {}
   res.json({ success: true });
 });
 
@@ -244,7 +257,6 @@ app.post('/api/ai/chat', async (req, res) => {
 app.get('/api/events', (req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*' });
   res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
-  // Send current status
   if (isConnected) res.write(`data: ${JSON.stringify({ type: 'wa_status', status: 'connected' })}\n\n`);
   if (lastPairingCode && !isConnected) res.write(`data: ${JSON.stringify({ type: 'pairing_code', code: lastPairingCode })}\n\n`);
   sseClients.push(res);
