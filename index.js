@@ -73,11 +73,13 @@ async function connectWhatsApp(phoneNumber) {
   const cleanNum = phoneNumber.replace(/[^0-9]/g, '');
   console.log('[WA] Starting connection for:', cleanNum);
 
-  // Always clear old session for fresh pairing
+  // Ensure auth_session directory exists
   const fs = require('fs');
-  try { fs.rmSync('./auth_session', { recursive: true, force: true }); } catch(e) {}
+  const path = require('path');
+  const authDir = path.join(process.cwd(), 'auth_session');
+  if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
 
-  const { state, saveCreds } = await useMultiFileAuthState('./auth_session');
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
   sock = makeWASocket({
     auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
@@ -182,13 +184,18 @@ app.post('/api/connect', async (req, res) => {
   isConnecting = false;
   lastPairingCode = '';
   
-  // Clear old session to get fresh pairing code
+  // Clear old session files (not folder) for fresh pairing
   const fs = require('fs');
-  try { fs.rmSync('./auth_session', { recursive: true, force: true }); } catch(e) {}
+  const path = require('path');
+  const authDir = path.join(process.cwd(), 'auth_session');
+  if (fs.existsSync(authDir)) {
+    const files = fs.readdirSync(authDir);
+    files.forEach(f => { try { fs.unlinkSync(path.join(authDir, f)); } catch(e) {} });
+  }
   
   try {
-    connectWhatsApp(phone);
-    res.json({ success: true, message: 'Connecting... wait for pairing code' });
+    await connectWhatsApp(phone);
+    res.json({ success: true, message: 'Connecting... wait ~8 seconds for pairing code' });
   } catch (e) {
     isConnecting = false;
     res.json({ success: false, message: e.message });
