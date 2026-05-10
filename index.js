@@ -170,14 +170,32 @@ app.get('/api/ping', (_, res) => res.json({ ok: true, server: 'Autikr' }));
 app.post('/api/connect', async (req, res) => {
   const { phone } = req.body;
   if (!phone) return res.json({ success: false, message: 'Phone number required' });
-  if (isConnecting) return res.json({ success: false, message: 'Already connecting, please wait...' });
   if (isConnected) return res.json({ success: true, message: 'Already connected!' });
+  
+  // Force clear any stuck state
+  if (sock) { try { sock.end(); } catch(e) {} sock = null; }
+  isConnecting = false;
+  lastPairingCode = '';
+  
+  // Clear old session to get fresh pairing code
+  const fs = require('fs');
+  try { fs.rmSync('./auth_session', { recursive: true, force: true }); } catch(e) {}
+  
   try {
     connectWhatsApp(phone);
     res.json({ success: true, message: 'Connecting... wait for pairing code' });
   } catch (e) {
+    isConnecting = false;
     res.json({ success: false, message: e.message });
   }
+});
+
+app.post('/api/reset', async (_, res) => {
+  if (sock) { try { sock.end(); } catch(e) {} sock = null; }
+  isConnected = false; isConnecting = false; lastPairingCode = '';
+  const fs = require('fs');
+  try { fs.rmSync('./auth_session', { recursive: true, force: true }); } catch(e) {}
+  res.json({ success: true, message: 'Session cleared' });
 });
 
 app.post('/api/disconnect', async (_, res) => {
