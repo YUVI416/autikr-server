@@ -14,8 +14,10 @@ const logger = pino({ level: 'silent' });
 // ─── State ──────────────────────────────────────────────────────
 let sock = null;
 let isConnected = false;
+let isConnecting = false;
 let autoReply = false;
 let sseClients = [];
+let lastPairingCode = '';
 let settings = {
   groqKey: '', geminiKey: '',
   systemPrompt: 'You are a highly intelligent and polite personal AI assistant. Reply to incoming WhatsApp messages naturally and concisely on my behalf. Keep responses friendly and brief unless detailed information is requested. Match the language of the incoming message.',
@@ -26,8 +28,6 @@ let stats = { received: 0, replied: 0, errors: 0 };
 // ─── AI Reply ───────────────────────────────────────────────────
 async function generateAIReply(message) {
   const prompt = settings.systemPrompt;
-
-  // Try Groq
   if (settings.groqKey) {
     try {
       const groq = new Groq({ apiKey: settings.groqKey });
@@ -40,8 +40,6 @@ async function generateAIReply(message) {
       if (reply) return reply.trim();
     } catch (e) { console.log('[AI] Groq error:', e.message); }
   }
-
-  // Fallback Gemini
   if (settings.geminiKey) {
     try {
       const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${settings.geminiKey}`, {
@@ -53,18 +51,32 @@ async function generateAIReply(message) {
       if (reply) return reply.trim();
     } catch (e) { console.log('[AI] Gemini error:', e.message); }
   }
-
   throw new Error('No API keys configured');
 }
 
 // ─── SSE Broadcast ──────────────────────────────────────────────
 function broadcast(type, data = {}) {
   const payload = JSON.stringify({ type, ...data, time: Date.now() });
-  sseClients.forEach(res => res.write(`data: ${payload}\n\n`));
+  sseClients.forEach(res => { try { res.write(`data: ${payload}\n\n`); } catch(e) {} });
 }
 
 // ─── WhatsApp Connection ────────────────────────────────────────
 async function connectWhatsApp(phoneNumber) {
+  // PREVENT MULTIPLE CONNECTIONS
+  if (isConnecting) {
+    console.log('[WA] Already connecting, skipping...');
+    return;
+  }
+  
+  // Close existing socket
+  if (sock) {
+    try { sock.end(); } catch(e) {}
+    sock = null;
+  }
+  
+  isConnecting = true;
+  console.log('[WA] Starting connection for:', phoneNumber);
+
   const { state, saveCreds } = await useMultiFileAuthState('./auth_session');
 
   sock = makeWASocket({
@@ -73,19 +85,23 @@ async function connectWhatsApp(phoneNumber) {
     browser: ['Autikr', 'Chrome', '120.0.0']
   });
 
-  // Request pairing code
+  // Request pairing code ONLY if not already registered
   if (!state.creds.registered) {
     const cleanNum = phoneNumber.replace(/[^0-9]/g, '');
     setTimeout(async () => {
       try {
         const code = await sock.requestPairingCode(cleanNum);
+        lastPairingCode = code;
         console.log('[WA] Pairing code:', code);
-        broadcast('pairing_code', { code: code });
+        broadcast('pairing_code', { code });
       } catch (e) {
         console.error('[WA] Pairing code error:', e.message);
         broadcast('error', { message: 'Failed to get pairing code: ' + e.message });
+        isConnecting = false;
       }
-    }, 3000);
+    }, 4000);
+  } else {
+    console.log('[WA] Already registered, connecting...');
   }
 
   sock.ev.on('creds.update', saveCreds);
@@ -94,15 +110,26 @@ async function connectWhatsApp(phoneNumber) {
     const { connection, lastDisconnect } = update;
     if (connection === 'close') {
       isConnected = false;
+      isConnecting = false;
       broadcast('wa_status', { status: 'disconnected' });
       const code = lastDisconnect?.error?.output?.statusCode;
-      if (code !== DisconnectReason.loggedOut) {
-        console.log('[WA] Reconnecting...');
-        setTimeout(() => connectWhatsApp(phoneNumber), 5000);
+      console.log('[WA] Connection closed, reason:', code);
+      
+      // Only reconnect if NOT logged out and already registered
+      if (code !== DisconnectReason.loggedOut && state.creds.registered) {
+        console.log('[WA] Reconnecting in 10s...');
+        setTimeout(() => connectWhatsApp(phoneNumber), 10000);
+      } else if (code === DisconnectReason.loggedOut) {
+        console.log('[WA] Logged out, clearing session');
+        // Clear session on logout
+        const fs = require('fs');
+        try { fs.rmSync('./auth_session', { recursive: true, force: true }); } catch(e) {}
       }
+      // Do NOT auto-reconnect if not registered (waiting for pairing)
     } else if (connection === 'open') {
       isConnected = true;
-      console.log('[WA] Connected!');
+      isConnecting = false;
+      console.log('[WA] ✅ Connected successfully!');
       broadcast('wa_status', { status: 'connected' });
     }
   });
@@ -128,6 +155,7 @@ async function connectWhatsApp(phoneNumber) {
         await sock.sendMessage(from, { text: reply });
         stats.replied++;
         broadcast('reply', { to: from, body: reply });
+        console.log('[WA] Replied to', from.split('@')[0]);
       } catch (e) {
         stats.errors++;
         broadcast('error', { message: e.message });
@@ -142,6 +170,8 @@ app.get('/api/ping', (_, res) => res.json({ ok: true, server: 'Autikr' }));
 app.post('/api/connect', async (req, res) => {
   const { phone } = req.body;
   if (!phone) return res.json({ success: false, message: 'Phone number required' });
+  if (isConnecting) return res.json({ success: false, message: 'Already connecting, please wait...' });
+  if (isConnected) return res.json({ success: true, message: 'Already connected!' });
   try {
     connectWhatsApp(phone);
     res.json({ success: true, message: 'Connecting... wait for pairing code' });
@@ -151,7 +181,10 @@ app.post('/api/connect', async (req, res) => {
 });
 
 app.post('/api/disconnect', async (_, res) => {
-  if (sock) { await sock.logout(); sock = null; isConnected = false; }
+  if (sock) { try { await sock.logout(); } catch(e) {} sock = null; }
+  isConnected = false; isConnecting = false;
+  const fs = require('fs');
+  try { fs.rmSync('./auth_session', { recursive: true, force: true }); } catch(e) {}
   res.json({ success: true });
 });
 
@@ -181,11 +214,13 @@ app.post('/api/ai/chat', async (req, res) => {
 app.get('/api/events', (req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*' });
   res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
+  // Send current status
+  if (isConnected) res.write(`data: ${JSON.stringify({ type: 'wa_status', status: 'connected' })}\n\n`);
+  if (lastPairingCode && !isConnected) res.write(`data: ${JSON.stringify({ type: 'pairing_code', code: lastPairingCode })}\n\n`);
   sseClients.push(res);
   req.on('close', () => { sseClients = sseClients.filter(c => c !== res); });
 });
 
-// ─── Start ──────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n⚡ AUTIKR SERVER running on port ${PORT}`);
   console.log(`📱 Mobile app can connect to this server\n`);
